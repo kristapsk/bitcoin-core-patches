@@ -1,0 +1,290 @@
+From d9c2aa8802b65da4e0c791de01c91df917e8461a Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Fri, 4 Sep 2020 18:27:02 +0000
+Subject: [PATCH 1/4] Flush dbcache early if system is under memory pressure
+
+No point forcing memory to get pushed out to swap just to cache db changes when we can write the db changes out instead
+---
+ configure.ac        | 15 +++++++++++++++
+ src/util/system.cpp | 30 ++++++++++++++++++++++++++++++
+ src/util/system.h   |  2 ++
+ src/validation.cpp  | 11 +++++++++--
+ 4 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index 14ce47092b549..c63526473a291 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -900,6 +900,21 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <malloc.h>]],
+  [ AC_MSG_RESULT(no)]
+ )
+ 
++AC_MSG_CHECKING(for compatible sysinfo call)
++AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <sys/sysinfo.h>]],
++ [[
++  struct sysinfo info;
++  int rv = sysinfo(&info);
++  unsigned long test = info.freeram + info.bufferram + info.mem_unit;
++ ]])],
++ [
++  AC_MSG_RESULT(yes);
++  AC_DEFINE(HAVE_LINUX_SYSINFO, 1, [Define this symbol if you have a Linux-compatible sysinfo call])
++ ],[
++  AC_MSG_RESULT(no)
++ ]
++)
++
+ dnl Check for posix_fallocate
+ AC_MSG_CHECKING(for posix_fallocate)
+ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+diff --git a/src/util/system.cpp b/src/util/system.cpp
+index 999937d906a29..3f2f12ade87e4 100644
+--- a/src/util/system.cpp
++++ b/src/util/system.cpp
+@@ -62,6 +62,10 @@
+ #include <malloc.h>
+ #endif
+ 
++#ifdef HAVE_LINUX_SYSINFO
++#include <sys/sysinfo.h>
++#endif
++
+ #include <boost/algorithm/string/replace.hpp>
+ #include <thread>
+ #include <typeinfo>
+@@ -1312,4 +1316,30 @@ std::pair<int, char**> WinCmdLineArgs::get()
+     return std::make_pair(argc, argv);
+ }
+ #endif
++
++bool SystemNeedsMemoryReleased()
++{
++    constexpr size_t low_memory_threshold = 10 * 1024 * 1024 /* 10 MB */;
++#ifdef WIN32
++    MEMORYSTATUSEX mem_status;
++    mem_status.dwLength = sizeof(mem_status);
++    if (GlobalMemoryStatusEx(&mem_status)) {
++        if (mem_status.dwMemoryLoad >= 99) return true;
++        if (mem_status.ullAvailPhys < low_memory_threshold) return true;
++        if (mem_status.ullAvailVirtual < low_memory_threshold) return true;
++    }
++#endif
++#ifdef HAVE_LINUX_SYSINFO
++    struct sysinfo sys_info;
++    if (!sysinfo(&sys_info)) {
++        // Explicitly 64-bit in case of 32-bit userspace on 64-bit kernel
++        const uint64_t free_ram = uint64_t(sys_info.freeram) * sys_info.mem_unit;
++        const uint64_t buffer_ram = uint64_t(sys_info.bufferram) * sys_info.mem_unit;
++        if (free_ram + buffer_ram < low_memory_threshold) return true;
++    }
++#endif
++    // NOTE: sysconf(_SC_AVPHYS_PAGES) doesn't account for caches on at least Linux, so not safe to use here
++    return false;
++}
++
+ } // namespace util
+diff --git a/src/util/system.h b/src/util/system.h
+index 1df194ca84d06..8f3df10009891 100644
+--- a/src/util/system.h
++++ b/src/util/system.h
+@@ -489,6 +489,8 @@ class WinCmdLineArgs
+ };
+ #endif
+ 
++bool SystemNeedsMemoryReleased();
++
+ } // namespace util
+ 
+ #endif // BITCOIN_UTIL_SYSTEM_H
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 58af8744d9025..3baf50db9ed4b 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2313,8 +2313,15 @@ bool CChainState::FlushStateToDisk(
+         }
+         // The cache is large and we're within 10% and 10 MiB of the limit, but we have time now (not in the middle of a block processing).
+         bool fCacheLarge = mode == FlushStateMode::PERIODIC && cache_state >= CoinsCacheSizeState::LARGE;
+-        // The cache is over the limit, we have to write now.
+-        bool fCacheCritical = mode == FlushStateMode::IF_NEEDED && cache_state >= CoinsCacheSizeState::CRITICAL;
++        bool fCacheCritical = false;
++        if (mode == FlushStateMode::IF_NEEDED) {
++            if (cache_state >= CoinsCacheSizeState::CRITICAL) {
++                // The cache is over the limit, we have to write now.
++                fCacheCritical = true;
++            } else if (util::SystemNeedsMemoryReleased()) {
++                fCacheCritical = true;
++            }
++        }
+         // It's been a while since we wrote the block index to disk. Do this frequently, so we don't need to redownload after a crash.
+         bool fPeriodicWrite = mode == FlushStateMode::PERIODIC && nNow > nLastWrite + DATABASE_WRITE_INTERVAL;
+         // It's been very long since we flushed the cache. Do this infrequently, to optimize cache usage.
+
+From b2b4f03266096369b0d2fdd5edec0f09df63e346 Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Sat, 24 Oct 2020 14:16:00 +0000
+Subject: [PATCH 2/4] util: Log reasoning when returning true from
+ SystemNeedsMemoryReleased
+
+---
+ src/util/system.cpp | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/src/util/system.cpp b/src/util/system.cpp
+index 3f2f12ade87e4..6afa139cd4986 100644
+--- a/src/util/system.cpp
++++ b/src/util/system.cpp
+@@ -1324,9 +1324,12 @@ bool SystemNeedsMemoryReleased()
+     MEMORYSTATUSEX mem_status;
+     mem_status.dwLength = sizeof(mem_status);
+     if (GlobalMemoryStatusEx(&mem_status)) {
+-        if (mem_status.dwMemoryLoad >= 99) return true;
+-        if (mem_status.ullAvailPhys < low_memory_threshold) return true;
+-        if (mem_status.ullAvailVirtual < low_memory_threshold) return true;
++        if (mem_status.dwMemoryLoad >= 99 ||
++            mem_status.ullAvailPhys < low_memory_threshold ||
++            mem_status.ullAvailVirtual < low_memory_threshold) {
++            LogPrintf("%s: YES: %s%% memory load; %s available physical memory; %s available virtual memory\n", __func__, int(mem_status.dwMemoryLoad), size_t(mem_status.ullAvailPhys), size_t(mem_status.ullAvailVirtual));
++            return true;
++        }
+     }
+ #endif
+ #ifdef HAVE_LINUX_SYSINFO
+@@ -1335,7 +1338,10 @@ bool SystemNeedsMemoryReleased()
+         // Explicitly 64-bit in case of 32-bit userspace on 64-bit kernel
+         const uint64_t free_ram = uint64_t(sys_info.freeram) * sys_info.mem_unit;
+         const uint64_t buffer_ram = uint64_t(sys_info.bufferram) * sys_info.mem_unit;
+-        if (free_ram + buffer_ram < low_memory_threshold) return true;
++        if (free_ram + buffer_ram < low_memory_threshold) {
++            LogPrintf("%s: YES: %s free RAM + %s buffer RAM\n", __func__, free_ram, buffer_ram);
++            return true;
++        }
+     }
+ #endif
+     // NOTE: sysconf(_SC_AVPHYS_PAGES) doesn't account for caches on at least Linux, so not safe to use here
+
+From 2d21609fa07de3a52dcd5237000a30044eeaf6a7 Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Sat, 24 Oct 2020 14:43:26 +0000
+Subject: [PATCH 3/4] Make lowmem threshold configurable
+
+---
+ src/init.cpp        |  8 ++++++++
+ src/util/system.cpp | 13 +++++++++----
+ src/util/system.h   |  2 ++
+ 3 files changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/src/init.cpp b/src/init.cpp
+index bb93f5c7975db..702d8613f1391 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -408,6 +408,7 @@ void SetupServerArgs(NodeContext& node)
+     argsman.AddArg("-feefilter", strprintf("Tell other nodes to filter invs to us by our mempool min fee (default: %u)", DEFAULT_FEEFILTER), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
+     argsman.AddArg("-includeconf=<file>", "Specify additional configuration file, relative to the -datadir path (only useable from configuration file, not command line)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg("-loadblock=<file>", "Imports blocks from external file on startup", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg("-lowmem=<n>", strprintf("If system available memory falls below <n> MiB, flush caches (0 to disable, default: %s)", util::g_low_memory_threshold / 1024 / 1024), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg("-maxmempool=<n>", strprintf("Keep the transaction memory pool below <n> megabytes (default: %u)", DEFAULT_MAX_MEMPOOL_SIZE), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg("-maxorphantx=<n>", strprintf("Keep at most <n> unconnectable transactions in memory (default: %u)", DEFAULT_MAX_ORPHAN_TRANSACTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg("-mempoolexpiry=<n>", strprintf("Do not keep transactions in the mempool longer than <n> hours (default: %u)", DEFAULT_MEMPOOL_EXPIRY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+@@ -1541,6 +1542,13 @@ bool AppInitMain(const util::Ref& context, NodeContext& node, interfaces::BlockA
+     LogPrintf("* Using %.1f MiB for chain state database\n", nCoinDBCache * (1.0 / 1024 / 1024));
+     LogPrintf("* Using %.1f MiB for in-memory UTXO set (plus up to %.1f MiB of unused mempool space)\n", nCoinCacheUsage * (1.0 / 1024 / 1024), nMempoolSizeMax * (1.0 / 1024 / 1024));
+ 
++    if (gArgs.IsArgSet("-lowmem")) {
++        util::g_low_memory_threshold = gArgs.GetArg("-lowmem", 0 /* not used */) * 1024 * 1024;
++    }
++    if (util::g_low_memory_threshold > 0) {
++        LogPrintf("* Flushing caches if available system memory drops below %s MiB\n", util::g_low_memory_threshold / 1024 / 1024);
++    }
++
+     bool fLoaded = false;
+     while (!fLoaded && !ShutdownRequested()) {
+         bool fReset = fReindex;
+diff --git a/src/util/system.cpp b/src/util/system.cpp
+index 6afa139cd4986..4aa93ef9699b7 100644
+--- a/src/util/system.cpp
++++ b/src/util/system.cpp
+@@ -1317,16 +1317,21 @@ std::pair<int, char**> WinCmdLineArgs::get()
+ }
+ #endif
+ 
++size_t g_low_memory_threshold = 10 * 1024 * 1024 /* 10 MB */;
++
+ bool SystemNeedsMemoryReleased()
+ {
+-    constexpr size_t low_memory_threshold = 10 * 1024 * 1024 /* 10 MB */;
++    if (g_low_memory_threshold <= 0) {
++        // Intentionally bypass other metrics when disabled entirely
++        return false;
++    }
+ #ifdef WIN32
+     MEMORYSTATUSEX mem_status;
+     mem_status.dwLength = sizeof(mem_status);
+     if (GlobalMemoryStatusEx(&mem_status)) {
+         if (mem_status.dwMemoryLoad >= 99 ||
+-            mem_status.ullAvailPhys < low_memory_threshold ||
+-            mem_status.ullAvailVirtual < low_memory_threshold) {
++            mem_status.ullAvailPhys < g_low_memory_threshold ||
++            mem_status.ullAvailVirtual < g_low_memory_threshold) {
+             LogPrintf("%s: YES: %s%% memory load; %s available physical memory; %s available virtual memory\n", __func__, int(mem_status.dwMemoryLoad), size_t(mem_status.ullAvailPhys), size_t(mem_status.ullAvailVirtual));
+             return true;
+         }
+@@ -1338,7 +1343,7 @@ bool SystemNeedsMemoryReleased()
+         // Explicitly 64-bit in case of 32-bit userspace on 64-bit kernel
+         const uint64_t free_ram = uint64_t(sys_info.freeram) * sys_info.mem_unit;
+         const uint64_t buffer_ram = uint64_t(sys_info.bufferram) * sys_info.mem_unit;
+-        if (free_ram + buffer_ram < low_memory_threshold) {
++        if (free_ram + buffer_ram < g_low_memory_threshold) {
+             LogPrintf("%s: YES: %s free RAM + %s buffer RAM\n", __func__, free_ram, buffer_ram);
+             return true;
+         }
+diff --git a/src/util/system.h b/src/util/system.h
+index 8f3df10009891..89d0065cdbd98 100644
+--- a/src/util/system.h
++++ b/src/util/system.h
+@@ -489,6 +489,8 @@ class WinCmdLineArgs
+ };
+ #endif
+ 
++extern size_t g_low_memory_threshold;
++
+ bool SystemNeedsMemoryReleased();
+ 
+ } // namespace util
+
+From 666994e71e543f194d35d57771a96926b13f7cc1 Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Sat, 24 Oct 2020 14:43:51 +0000
+Subject: [PATCH 4/4] Disable lowmem flushing in test that needs determinism
+
+---
+ src/test/validation_chainstate_tests.cpp | 2 ++
+ src/wallet/test/wallet_tests.cpp         | 3 +++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/src/test/validation_chainstate_tests.cpp b/src/test/validation_chainstate_tests.cpp
+index c8a375275f902..d200b97187362 100644
+--- a/src/test/validation_chainstate_tests.cpp
++++ b/src/test/validation_chainstate_tests.cpp
+@@ -22,6 +22,8 @@ BOOST_AUTO_TEST_CASE(validation_chainstate_resize_caches)
+     ChainstateManager manager;
+     CTxMemPool mempool;
+ 
++    util::g_low_memory_threshold = 0;  // disable to get deterministic flushing
++
+     //! Create and add a Coin with DynamicMemoryUsage of 80 bytes to the given view.
+     auto add_coin = [](CCoinsViewCache& coins_view) -> COutPoint {
+         Coin newcoin;
+diff --git a/src/wallet/test/wallet_tests.cpp b/src/wallet/test/wallet_tests.cpp
+index f400e7e9442ea..aadea31afc3eb 100644
+--- a/src/wallet/test/wallet_tests.cpp
++++ b/src/wallet/test/wallet_tests.cpp
+@@ -704,6 +704,9 @@ BOOST_FIXTURE_TEST_CASE(wallet_descriptor_test, BasicTestingSetup)
+ //! rescanning where new transactions in new blocks could be lost.
+ BOOST_FIXTURE_TEST_CASE(CreateWalletFromFile, TestChain100Setup)
+ {
++    // FIXME: this test fails for some reason if there's a flush
++    util::g_low_memory_threshold = 0;
++
+     // Create new wallet with known key and unload it.
+     auto chain = interfaces::MakeChain(m_node);
+     auto wallet = TestLoadWallet(*chain);

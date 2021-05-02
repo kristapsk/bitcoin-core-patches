@@ -1,0 +1,63 @@
+From 2c35ce710d3ca250f26daf2bc8b364e3bd124d5c Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Sat, 2 Jan 2021 01:46:00 +0000
+Subject: [PATCH] During IBD, prune as much as possible until we get close to
+ where we will eventually keep blocks
+
+---
+ src/validation.cpp | 14 ++++++++------
+ src/validation.h   |  2 +-
+ 2 files changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/src/validation.cpp b/src/validation.cpp
+index feb7502a0fa54..4bd5aefacfd21 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2308,7 +2308,7 @@ bool CChainState::FlushStateToDisk(
+             } else {
+                 LOG_TIME_MILLIS_WITH_CATEGORY("find files to prune", BCLog::BENCH);
+ 
+-                m_blockman.FindFilesToPrune(setFilesToPrune, chainparams.PruneAfterHeight(), m_chain.Height(), IsInitialBlockDownload());
++                m_blockman.FindFilesToPrune(setFilesToPrune, chainparams.PruneAfterHeight(), m_chain.Height(), IsInitialBlockDownload(), pindexBestHeader->nHeight);
+                 fCheckForPruning = false;
+             }
+             if (!setFilesToPrune.empty()) {
+@@ -3995,7 +3995,7 @@ void PruneBlockFilesManual(int nManualPruneHeight)
+     }
+ }
+ 
+-void BlockManager::FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPruneAfterHeight, int chain_tip_height, bool is_ibd)
++void BlockManager::FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPruneAfterHeight, int chain_tip_height, bool is_ibd, uint64_t target_sync_height)
+ {
+     LOCK2(cs_main, cs_LastBlockFile);
+     if (chain_tip_height < 0 || nPruneTarget == 0) {
+@@ -4018,10 +4018,12 @@ void BlockManager::FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPr
+         // On a prune event, the chainstate DB is flushed.
+         // To avoid excessive prune events negating the benefit of high dbcache
+         // values, we should not prune too rapidly.
+-        // So when pruning in IBD, increase the buffer a bit to avoid a re-prune too soon.
+-        if (is_ibd) {
+-            // Since this is only relevant during IBD, we use a fixed 10%
+-            nBuffer += nPruneTarget / 10;
++        // So when pruning in IBD, increase the buffer to avoid a re-prune too soon.
++        if (is_ibd && target_sync_height > (uint64_t)chain_tip_height) {
++            // Since this is only relevant during IBD, we assume blocks are at least 1 MB on average
++            static constexpr uint64_t average_block_size = 1000000;  /* 1 MB */
++            const uint64_t remaining_blocks = target_sync_height - chain_tip_height;
++            nBuffer += average_block_size * remaining_blocks;
+         }
+ 
+         for (int fileNumber = 0; fileNumber < nLastBlockFile; fileNumber++) {
+diff --git a/src/validation.h b/src/validation.h
+index ffb038ad75f0d..1cc26925807c9 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -375,7 +375,7 @@ class BlockManager
+      *
+      * @param[out]   setFilesToPrune   The set of file indices that can be unlinked will be returned
+      */
+-    void FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPruneAfterHeight, int chain_tip_height, bool is_ibd);
++    void FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPruneAfterHeight, int chain_tip_height, bool is_ibd, uint64_t target_sync_height);
+ 
+ public:
+     BlockMap m_block_index GUARDED_BY(cs_main);

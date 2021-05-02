@@ -1,0 +1,374 @@
+diff --git a/configure.ac b/configure.ac
+index 6e13780e14..05ae9e10d5 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -952,6 +952,44 @@ AC_LINK_IFELSE([AC_LANG_SOURCE([
+   ]
+ )
+ 
++AC_MSG_CHECKING(for iopolicy functions)
++AC_COMPILE_IFELSE([
++  AC_LANG_PROGRAM([[
++    #include <sys/resource.h>
++  ]],[[
++    int x = getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD);
++    setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, x);
++  ]])
++],[
++  have_iopolicy=yes
++  AC_DEFINE(HAVE_IOPOLICY,1,[Define this symbol if you have iopolicy functions])
++],[
++  have_iopolicy=no
++])
++AC_MSG_RESULT($have_iopolicy)
++
++if test x$have_iopolicy = xno; then
++  AC_MSG_CHECKING(for ioprio syscalls)
++  AC_COMPILE_IFELSE([
++    AC_LANG_PROGRAM([[
++      #define _GNU_SOURCE
++      #include <unistd.h>
++      #include <sys/syscall.h>
++    ]],[[
++      int x = syscall(SYS_ioprio_get, 1, 0);
++      syscall(SYS_ioprio_set, 1, 0, x);
++    ]])
++  ],[
++    have_ioprio_syscall=yes
++    AC_DEFINE(HAVE_IOPRIO_SYSCALL,1,[Define this symbol if you have ioprio syscalls])
++  ],[
++    have_ioprio_syscall=no
++  ])
++  AC_MSG_RESULT($have_ioprio_syscall)
++else
++  have_ioprio_syscall=no
++fi
++
+ dnl thread_local is currently disabled when building with glibc back compat.
+ dnl Our minimum supported glibc is 2.17, however support for thread_local
+ dnl did not arrive in glibc until 2.18.
+@@ -1614,6 +1652,8 @@ AM_CONDITIONAL([USE_QRCODE], [test x$use_qr = xyes])
+ AM_CONDITIONAL([USE_LCOV],[test x$use_lcov = xyes])
+ AM_CONDITIONAL([USE_LIBEVENT],[test x$use_libevent = xyes])
+ AM_CONDITIONAL([GLIBC_BACK_COMPAT],[test x$use_glibc_compat = xyes])
++AM_CONDITIONAL([HAVE_IOPOLICY],[test x$have_iopolicy = xyes])
++AM_CONDITIONAL([HAVE_IOPRIO_SYSCALL],[test x$have_ioprio_syscall = xyes])
+ AM_CONDITIONAL([HARDEN],[test x$use_hardening = xyes])
+ AM_CONDITIONAL([ENABLE_SSE42],[test x$enable_sse42 = xyes])
+ AM_CONDITIONAL([ENABLE_SSE41],[test x$enable_sse41 = xyes])
+diff --git a/src/Makefile.am b/src/Makefile.am
+index c26cb34549..2028645904 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -223,6 +223,7 @@ BITCOIN_CORE_H = \
+   util/error.h \
+   util/fees.h \
+   util/golombrice.h \
++  util/ioprio.h \
+   util/macros.h \
+   util/memory.h \
+   util/message.h \
+@@ -538,6 +539,7 @@ libbitcoin_util_a_SOURCES = \
+   util/bytevectorhash.cpp \
+   util/error.cpp \
+   util/fees.cpp \
++  util/ioprio.cpp \
+   util/system.cpp \
+   util/message.cpp \
+   util/moneystr.cpp \
+diff --git a/src/bitcoin-util b/src/bitcoin-util
+new file mode 100755
+index 0000000000..d2faf78e17
+Binary files /dev/null and b/src/bitcoin-util differ
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index f29be8d8a3..2d40d87f8b 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -1563,7 +1563,7 @@ void static ProcessGetBlockData(CNode& pfrom, const CChainParams& chainparams, c
+             // Fast-path: in this case it is possible to serve the block directly from disk,
+             // as the network format matches the format on disk
+             std::vector<uint8_t> block_data;
+-            if (!ReadRawBlockFromDisk(block_data, pindex, chainparams.MessageStart())) {
++            if (!ReadRawBlockFromDisk(block_data, pindex, chainparams.MessageStart(), true)) {
+                 assert(!"cannot load block from disk");
+             }
+             connman.PushMessage(&pfrom, msgMaker.Make(NetMsgType::BLOCK, MakeSpan(block_data)));
+@@ -1571,8 +1571,9 @@ void static ProcessGetBlockData(CNode& pfrom, const CChainParams& chainparams, c
+         } else {
+             // Send block from disk
+             std::shared_ptr<CBlock> pblockRead = std::make_shared<CBlock>();
+-            if (!ReadBlockFromDisk(*pblockRead, pindex, consensusParams))
++            if (!ReadBlockFromDisk(*pblockRead, pindex, consensusParams, true)) {
+                 assert(!"cannot load block from disk");
++            }
+             pblock = pblockRead;
+         }
+         if (pblock) {
+@@ -2849,7 +2850,7 @@ void PeerManager::ProcessMessage(CNode& pfrom, const std::string& msg_type, CDat
+ 
+             if (pindex->nHeight >= ::ChainActive().Height() - MAX_BLOCKTXN_DEPTH) {
+                 CBlock block;
+-                bool ret = ReadBlockFromDisk(block, pindex, m_chainparams.GetConsensus());
++                bool ret = ReadBlockFromDisk(block, pindex, m_chainparams.GetConsensus(), true);
+                 assert(ret);
+ 
+                 SendBlockTransactions(pfrom, block, req);
+@@ -4254,7 +4255,7 @@ bool PeerManager::SendMessages(CNode* pto)
+                     }
+                     if (!fGotBlockFromCache) {
+                         CBlock block;
+-                        bool ret = ReadBlockFromDisk(block, pBestIndex, consensusParams);
++                        bool ret = ReadBlockFromDisk(block, pBestIndex, consensusParams, true);
+                         assert(ret);
+                         CBlockHeaderAndShortTxIDs cmpctblock(block, state.fWantsCmpctWitness);
+                         m_connman.PushMessage(pto, msgMaker.Make(nSendFlags, NetMsgType::CMPCTBLOCK, cmpctblock));
+diff --git a/src/util/ioprio.cpp b/src/util/ioprio.cpp
+new file mode 100644
+index 0000000000..db280b4e87
+--- /dev/null
++++ b/src/util/ioprio.cpp
+@@ -0,0 +1,57 @@
++// Copyright (c) 2016 The Bitcoin Core developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#if defined(HAVE_CONFIG_H)
++#include <config/bitcoin-config.h>
++#endif
++
++#include <util/ioprio.h>
++
++#ifdef HAVE_IOPRIO_SYSCALL
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <unistd.h>
++#include <sys/syscall.h>
++
++#ifndef IOPRIO_WHO_PROCESS
++#define IOPRIO_WHO_PROCESS   1
++#endif
++#ifndef IOPRIO_CLASS_IDLE
++#define IOPRIO_CLASS_IDLE    3
++#endif
++#ifndef IOPRIO_CLASS_SHIFT
++#define IOPRIO_CLASS_SHIFT  13
++#endif
++
++int ioprio_get() {
++    return syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0);
++}
++
++int ioprio_set(const int ioprio) {
++    return syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, ioprio);
++}
++
++int ioprio_set_idle() {
++    return ioprio_set(7 | (IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT));
++}
++
++#elif HAVE_IOPOLICY
++
++#include <sys/resource.h>
++
++int ioprio_get() {
++    return getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD);
++}
++
++int ioprio_set(const int ioprio) {
++    return setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, ioprio);
++}
++
++int ioprio_set_idle() {
++    return ioprio_set(IOPOL_UTILITY);
++}
++
++#endif
+diff --git a/src/util/ioprio.h b/src/util/ioprio.h
+new file mode 100644
+index 0000000000..e91ad59d53
+--- /dev/null
++++ b/src/util/ioprio.h
+@@ -0,0 +1,57 @@
++// Copyright (c) 2016 Satoshi Nakamoto
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_UTIL_IOPRIO_H
++#define BITCOIN_UTIL_IOPRIO_H
++
++#if defined(HAVE_CONFIG_H)
++#include <config/bitcoin-config.h>
++#endif
++
++#include <util/system.h>
++
++#if defined(HAVE_IOPRIO_SYSCALL) || defined(HAVE_IOPOLICY)
++int ioprio_get();
++int ioprio_set(int ioprio);
++int ioprio_set_idle();
++
++class ioprio_idler {
++private:
++    int orig;
++
++public:
++    ioprio_idler(const bool actually_idle) {
++        if (!actually_idle) {
++            orig = -1;
++            return;
++        }
++
++        orig = ioprio_get();
++        if (orig == -1) {
++            return;
++        }
++        if (ioprio_set_idle() == -1) {
++            orig = -1;
++        }
++    }
++
++    ~ioprio_idler() {
++        if (orig == -1) {
++            return;
++        }
++        if (ioprio_set(orig) == -1) {
++            LogPrintf("failed to restore ioprio\n");
++        }
++    }
++};
++#define IOPRIO_IDLER(actually_idle)  ioprio_idler ioprio_idler_(actually_idle)
++
++#else
++#define ioprio_get() ((void)-1)
++#define ioprio_set(ioprio) ((void)-1)
++#define ioprio_set_idle() ((void)-1)
++#define IOPRIO_IDLER(actually_idle)  (void)actually_idle;
++#endif
++
++#endif // BITCOIN_UTIL_IOPRIO_H
+diff --git a/src/validation.cpp b/src/validation.cpp
+index feb7502a0f..15f00fe8c7 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -41,6 +41,7 @@
+ #include <uint256.h>
+ #include <undo.h>
+ #include <util/check.h> // For NDEBUG compile time check
++#include <util/ioprio.h>
+ #include <util/moneystr.h>
+ #include <util/rbf.h>
+ #include <util/strencodings.h>
+@@ -1142,10 +1143,13 @@ static bool WriteBlockToDisk(const CBlock& block, FlatFilePos& pos, const CMessa
+     return true;
+ }
+ 
+-bool ReadBlockFromDisk(CBlock& block, const FlatFilePos& pos, const Consensus::Params& consensusParams)
++bool ReadBlockFromDisk(CBlock& block, const FlatFilePos& pos, const Consensus::Params& consensusParams, const bool lowprio)
+ {
+     block.SetNull();
+ 
++    {
++    IOPRIO_IDLER(lowprio);
++
+     // Open history file to read
+     CAutoFile filein(OpenBlockFile(pos, true), SER_DISK, CLIENT_VERSION);
+     if (filein.IsNull())
+@@ -1159,6 +1163,8 @@ bool ReadBlockFromDisk(CBlock& block, const FlatFilePos& pos, const Consensus::P
+         return error("%s: Deserialize or I/O error - %s at %s", __func__, e.what(), pos.ToString());
+     }
+ 
++    }  // end IOPRIO_IDLER scope
++
+     // Check the header
+     if (!CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
+         return error("ReadBlockFromDisk: Errors in block header at %s", pos.ToString());
+@@ -1171,7 +1177,7 @@ bool ReadBlockFromDisk(CBlock& block, const FlatFilePos& pos, const Consensus::P
+     return true;
+ }
+ 
+-bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus::Params& consensusParams)
++bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus::Params& consensusParams, const bool lowprio)
+ {
+     FlatFilePos blockPos;
+     {
+@@ -1179,7 +1185,7 @@ bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus
+         blockPos = pindex->GetBlockPos();
+     }
+ 
+-    if (!ReadBlockFromDisk(block, blockPos, consensusParams))
++    if (!ReadBlockFromDisk(block, blockPos, consensusParams, lowprio))
+         return false;
+     if (block.GetHash() != pindex->GetBlockHash())
+         return error("ReadBlockFromDisk(CBlock&, CBlockIndex*): GetHash() doesn't match index for %s at %s",
+@@ -1187,10 +1193,13 @@ bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus
+     return true;
+ }
+ 
+-bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const FlatFilePos& pos, const CMessageHeader::MessageStartChars& message_start)
++bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const FlatFilePos& pos, const CMessageHeader::MessageStartChars& message_start, const bool lowprio)
+ {
+     FlatFilePos hpos = pos;
+     hpos.nPos -= 8; // Seek back 8 bytes for meta header
++
++    IOPRIO_IDLER(lowprio);
++
+     CAutoFile filein(OpenBlockFile(hpos, true), SER_DISK, CLIENT_VERSION);
+     if (filein.IsNull()) {
+         return error("%s: OpenBlockFile failed for %s", __func__, pos.ToString());
+@@ -1222,7 +1231,7 @@ bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const FlatFilePos& pos, c
+     return true;
+ }
+ 
+-bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const CBlockIndex* pindex, const CMessageHeader::MessageStartChars& message_start)
++bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const CBlockIndex* pindex, const CMessageHeader::MessageStartChars& message_start, const bool lowprio)
+ {
+     FlatFilePos block_pos;
+     {
+@@ -1230,7 +1239,7 @@ bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const CBlockIndex* pindex
+         block_pos = pindex->GetBlockPos();
+     }
+ 
+-    return ReadRawBlockFromDisk(block, block_pos, message_start);
++    return ReadRawBlockFromDisk(block, block_pos, message_start, lowprio);
+ }
+ 
+ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
+@@ -4300,7 +4309,7 @@ bool CVerifyDB::VerifyDB(const CChainParams& chainparams, CCoinsView *coinsview,
+         }
+         CBlock block;
+         // check level 0: read from disk
+-        if (!ReadBlockFromDisk(block, pindex, chainparams.GetConsensus()))
++        if (!ReadBlockFromDisk(block, pindex, chainparams.GetConsensus(), true))
+             return error("VerifyDB(): *** ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
+         // check level 1: verify block validity
+         if (nCheckLevel >= 1 && !CheckBlock(block, state, chainparams.GetConsensus()))
+@@ -4349,7 +4358,7 @@ bool CVerifyDB::VerifyDB(const CChainParams& chainparams, CCoinsView *coinsview,
+             uiInterface.ShowProgress(_("Verifying blocks...").translated, percentageDone, false);
+             pindex = ::ChainActive().Next(pindex);
+             CBlock block;
+-            if (!ReadBlockFromDisk(block, pindex, chainparams.GetConsensus()))
++            if (!ReadBlockFromDisk(block, pindex, chainparams.GetConsensus(), true))
+                 return error("VerifyDB(): *** ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
+             if (!::ChainstateActive().ConnectBlock(block, state, pindex, coins, chainparams))
+                 return error("VerifyDB(): *** found unconnectable block at %d, hash=%s (%s)", pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
+diff --git a/src/validation.h b/src/validation.h
+index ffb038ad75..82fc306f3a 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -285,10 +285,10 @@ void InitScriptExecutionCache();
+ 
+ 
+ /** Functions for disk access for blocks */
+-bool ReadBlockFromDisk(CBlock& block, const FlatFilePos& pos, const Consensus::Params& consensusParams);
+-bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus::Params& consensusParams);
+-bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const FlatFilePos& pos, const CMessageHeader::MessageStartChars& message_start);
+-bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const CBlockIndex* pindex, const CMessageHeader::MessageStartChars& message_start);
++bool ReadBlockFromDisk(CBlock& block, const FlatFilePos& pos, const Consensus::Params& consensusParams, bool lowprio = false);
++bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus::Params& consensusParams, bool lowprio = false);
++bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const FlatFilePos& pos, const CMessageHeader::MessageStartChars& message_start, bool lowprio = false);
++bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const CBlockIndex* pindex, const CMessageHeader::MessageStartChars& message_start, bool lowprio = false);
+ 
+ bool UndoReadFromDisk(CBlockUndo& blockundo, const CBlockIndex* pindex);
+ 

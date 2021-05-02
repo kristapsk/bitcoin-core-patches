@@ -1,0 +1,39 @@
+From ba860c7b2af7fd9cd4b3d314f2d9cd393fcde655 Mon Sep 17 00:00:00 2001
+From: Kristaps Kaupe <kristaps@blogiem.lv>
+Date: Sat, 28 Dec 2019 04:47:51 +0200
+Subject: [PATCH] Optimize ToLower() and ToUpper()
+
+Flipping 6th bit instead of adding and subtraction to switch from
+lowercase to uppercase and vice versa in ASCII is a well known bit hack.
+---
+ src/util/strencodings.h | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/util/strencodings.h b/src/util/strencodings.h
+index e35b2ab8571e4..ede7e009e728c 100644
+--- a/src/util/strencodings.h
++++ b/src/util/strencodings.h
+@@ -205,9 +205,9 @@ bool ConvertBits(const O& outfn, I it, I end) {
+  * @return          the lowercase equivalent of c; or the argument
+  *                  if no conversion is possible.
+  */
+-constexpr char ToLower(char c)
++constexpr char ToLower(const char c)
+ {
+-    return (c >= 'A' && c <= 'Z' ? (c - 'A') + 'a' : c);
++    return (c >= 'A' && c <= 'Z' ? c | 0x20 : c);
+ }
+ 
+ /**
+@@ -231,9 +231,9 @@ std::string ToLower(const std::string& str);
+  * @return          the uppercase equivalent of c; or the argument
+  *                  if no conversion is possible.
+  */
+-constexpr char ToUpper(char c)
++constexpr char ToUpper(const char c)
+ {
+-    return (c >= 'a' && c <= 'z' ? (c - 'a') + 'A' : c);
++    return (c >= 'a' && c <= 'z' ? c & ~0x20 : c);
+ }
+ 
+ /**

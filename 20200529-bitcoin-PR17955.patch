@@ -1,0 +1,97 @@
+From 0139b428923c8e84cbad26c47a2a6c3c2d0e5d1b Mon Sep 17 00:00:00 2001
+From: Emil Engler <me@emilengler.com>
+Date: Fri, 29 May 2020 11:07:15 +0200
+Subject: [PATCH] gui: Paste button in Open URI dialog
+
+---
+ src/qt/bitcoingui.cpp         |  2 +-
+ src/qt/forms/openuridialog.ui | 17 +++++++++++++++++
+ src/qt/openuridialog.cpp      |  6 ++++--
+ src/qt/openuridialog.h        |  4 +++-
+ 4 files changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/src/qt/bitcoingui.cpp b/src/qt/bitcoingui.cpp
+index 6192013e5fe0e..a4501a5ab48d3 100644
+--- a/src/qt/bitcoingui.cpp
++++ b/src/qt/bitcoingui.cpp
+@@ -831,7 +831,7 @@ void BitcoinGUI::showHelpMessageClicked()
+ #ifdef ENABLE_WALLET
+ void BitcoinGUI::openClicked()
+ {
+-    OpenURIDialog dlg(this);
++    OpenURIDialog dlg(platformStyle, this);
+     if(dlg.exec())
+     {
+         Q_EMIT receivedURI(dlg.getURI());
+diff --git a/src/qt/forms/openuridialog.ui b/src/qt/forms/openuridialog.ui
+index 1b7291ab9dabf..981d9255e4532 100644
+--- a/src/qt/forms/openuridialog.ui
++++ b/src/qt/forms/openuridialog.ui
+@@ -30,6 +30,23 @@
+        </property>
+       </widget>
+      </item>
++     <item>
++      <widget class="QPushButton" name="pasteButton">
++       <property name="toolTip">
++        <string>Paste address from clipboard</string>
++       </property>
++       <property name="text">
++        <string/>
++       </property>
++       <property name="icon">
++        <iconset resource="../bitcoin.qrc">
++         <normaloff>:/icons/editpaste</normaloff>:/icons/editpaste</iconset>
++        </property>
++        <property name="shortcut">
++         <string>Alt+P</string>
++        </property>
++      </widget>
++     </item>
+     </layout>
+    </item>
+    <item>
+diff --git a/src/qt/openuridialog.cpp b/src/qt/openuridialog.cpp
+index 9a3d43c2a65a1..3807d6630a380 100644
+--- a/src/qt/openuridialog.cpp
++++ b/src/qt/openuridialog.cpp
+@@ -9,13 +9,15 @@
+ #include <qt/sendcoinsrecipient.h>
+ 
+ #include <QUrl>
++#include <QClipboard>
+ 
+-OpenURIDialog::OpenURIDialog(QWidget *parent) :
++OpenURIDialog::OpenURIDialog(const PlatformStyle *platformStyle, QWidget *parent) :
+     QDialog(parent),
+     ui(new Ui::OpenURIDialog)
+ {
+     ui->setupUi(this);
+-
++    ui->pasteButton->setIcon(platformStyle->SingleColorIcon(":/icons/editpaste"));
++    QObject::connect(ui->pasteButton, &QPushButton::clicked, [=] { ui->uriEdit->setText(QApplication::clipboard()->text()); });
+     GUIUtil::handleCloseWindowShortcut(this);
+ }
+ 
+diff --git a/src/qt/openuridialog.h b/src/qt/openuridialog.h
+index 667af2ec750c5..62ba8271bfdae 100644
+--- a/src/qt/openuridialog.h
++++ b/src/qt/openuridialog.h
+@@ -7,6 +7,8 @@
+ 
+ #include <QDialog>
+ 
++#include <qt/platformstyle.h>
++
+ namespace Ui {
+     class OpenURIDialog;
+ }
+@@ -16,7 +18,7 @@ class OpenURIDialog : public QDialog
+     Q_OBJECT
+ 
+ public:
+-    explicit OpenURIDialog(QWidget *parent);
++    explicit OpenURIDialog(const PlatformStyle* platformStyle, QWidget *parent);
+     ~OpenURIDialog();
+ 
+     QString getURI();

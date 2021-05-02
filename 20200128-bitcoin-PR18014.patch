@@ -1,0 +1,204 @@
+From 610a5b21fdf809ab4f1d15003484b518b6dde26a Mon Sep 17 00:00:00 2001
+From: Elichai Turkel <elichai.turkel@gmail.com>
+Date: Tue, 28 Jan 2020 18:45:19 +0200
+Subject: [PATCH 1/2] Add more benchmarks to siphash
+
+---
+ src/bench/crypto_hash.cpp | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/bench/crypto_hash.cpp b/src/bench/crypto_hash.cpp
+index 30fe11be6b303..1c3ce0f9af8ee 100644
+--- a/src/bench/crypto_hash.cpp
++++ b/src/bench/crypto_hash.cpp
+@@ -85,11 +85,32 @@ static void SipHash_32b(benchmark::Bench& bench)
+ {
+     uint256 x;
+     uint64_t k1 = 0;
+-    bench.run([&] {
++    bench.batch(x.size()).unit("byte").run([&] {
+         *((uint64_t*)x.begin()) = SipHashUint256(0, ++k1, x);
+     });
+ }
+ 
++static void SipHash_3b(benchmark::Bench& bench)
++{
++    uint64_t hash = 0;
++    uint64_t k2 = 0;
++    std::vector<uint8_t> in(3, 0xee);
++    bench.batch(in.size()).unit("byte").run([&] {
++        hash = CSipHasher(hash, ++k2).Write(in.data(), in.size()).Finalize();
++    });
++}
++
++
++static void SipHash(benchmark::Bench& bench)
++{
++    uint64_t hash = 0;
++    uint64_t k2 = 0;
++    std::vector<uint8_t> in(BUFFER_SIZE, 0);
++    bench.batch(in.size()).unit("byte").run([&] {
++        hash = CSipHasher(hash, ++k2).Write(in.data(), in.size()).Finalize();
++    });
++}
++
+ static void FastRandom_32bit(benchmark::Bench& bench)
+ {
+     FastRandomContext rng(true);
+@@ -159,9 +180,11 @@ BENCHMARK(SHA1);
+ BENCHMARK(SHA256);
+ BENCHMARK(SHA512);
+ BENCHMARK(SHA3_256_1M);
++BENCHMARK(SipHash);
+ 
+ BENCHMARK(SHA256_32b);
+ BENCHMARK(SipHash_32b);
++BENCHMARK(SipHash_3b);
+ BENCHMARK(SHA256D64_1024);
+ BENCHMARK(FastRandom_32bit);
+ BENCHMARK(FastRandom_1bit);
+
+From 19e28a41168d02dc85356714c889b43d96d834d6 Mon Sep 17 00:00:00 2001
+From: Elichai Turkel <elichai.turkel@gmail.com>
+Date: Tue, 28 Jan 2020 18:50:00 +0200
+Subject: [PATCH 2/2] Optimized siphash implementation
+
+---
+ src/crypto/siphash.cpp | 62 ++++++++++++++++++++++++++++++++----------
+ src/crypto/siphash.h   |  4 +--
+ 2 files changed, 49 insertions(+), 17 deletions(-)
+
+diff --git a/src/crypto/siphash.cpp b/src/crypto/siphash.cpp
+index 2e90c393e1693..f78771868ada5 100644
+--- a/src/crypto/siphash.cpp
++++ b/src/crypto/siphash.cpp
+@@ -2,8 +2,11 @@
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
++#include <crypto/common.h>
+ #include <crypto/siphash.h>
+ 
++#include <algorithm>
++
+ #define ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+ 
+ #define SIPROUND do { \
+@@ -22,14 +25,14 @@ CSipHasher::CSipHasher(uint64_t k0, uint64_t k1)
+     v[2] = 0x6c7967656e657261ULL ^ k0;
+     v[3] = 0x7465646279746573ULL ^ k1;
+     count = 0;
+-    tmp = 0;
++    tail = 0;
+ }
+ 
+ CSipHasher& CSipHasher::Write(uint64_t data)
+ {
+     uint64_t v0 = v[0], v1 = v[1], v2 = v[2], v3 = v[3];
+ 
+-    assert(count % 8 == 0);
++    assert((count & 0x07) == 0);
+ 
+     v3 ^= data;
+     SIPROUND;
+@@ -45,30 +48,57 @@ CSipHasher& CSipHasher::Write(uint64_t data)
+     return *this;
+ }
+ 
++
++/// Load a uint64_t from 0 to 7 bytes.
++inline uint64_t ReadU64ByLenLE(const unsigned char* data, size_t len)
++{
++    assert(len < 8);
++    uint64_t out = 0;
++    for (size_t i = 0; i < len; ++i) {
++        out |= (uint64_t)data[i] << (i * 8);
++    }
++    return out;
++}
++
+ CSipHasher& CSipHasher::Write(const unsigned char* data, size_t size)
+ {
+     uint64_t v0 = v[0], v1 = v[1], v2 = v[2], v3 = v[3];
+-    uint64_t t = tmp;
+-    uint8_t c = count;
+-
+-    while (size--) {
+-        t |= ((uint64_t)(*(data++))) << (8 * (c % 8));
+-        c++;
+-        if ((c & 7) == 0) {
+-            v3 ^= t;
++    auto ntail = count & 0x07;
++    count += size;
++
++    size_t needed = 0;
++
++    if (ntail != 0) {
++        needed = 8 - ntail;
++        tail |= ReadU64ByLenLE(data, std::min(size, needed)) << 8 * ntail;
++        if (size < needed) {
++            return *this;
++        } else {
++            v3 ^= tail;
+             SIPROUND;
+             SIPROUND;
+-            v0 ^= t;
+-            t = 0;
++            v0 ^= tail;
+         }
+     }
+ 
++    size_t len = size - needed;
++    auto left = len & 0x07;
++
++    auto i = needed;
++    while (i < len - left) {
++        uint64_t mi = ReadLE64(data + i);
++        v3 ^= mi;
++        SIPROUND;
++        SIPROUND;
++        v0 ^= mi;
++        i += 8;
++    }
++
+     v[0] = v0;
+     v[1] = v1;
+     v[2] = v2;
+     v[3] = v3;
+-    count = c;
+-    tmp = t;
++    tail = ReadU64ByLenLE(data + i, left);
+ 
+     return *this;
+ }
+@@ -77,12 +107,14 @@ uint64_t CSipHasher::Finalize() const
+ {
+     uint64_t v0 = v[0], v1 = v[1], v2 = v[2], v3 = v[3];
+ 
+-    uint64_t t = tmp | (((uint64_t)count) << 56);
++
++    uint64_t t = tail | (((uint64_t)count) << 56);
+ 
+     v3 ^= t;
+     SIPROUND;
+     SIPROUND;
+     v0 ^= t;
++
+     v2 ^= 0xFF;
+     SIPROUND;
+     SIPROUND;
+diff --git a/src/crypto/siphash.h b/src/crypto/siphash.h
+index b573526932d53..4b630f229057f 100644
+--- a/src/crypto/siphash.h
++++ b/src/crypto/siphash.h
+@@ -14,8 +14,8 @@ class CSipHasher
+ {
+ private:
+     uint64_t v[4];
+-    uint64_t tmp;
+-    uint8_t count; // Only the low 8 bits of the input size matter.
++    uint64_t tail; // bytes that weren't processed yet.
++    uint8_t count;  // total amount of bytes inputted.
+ 
+ public:
+     /** Construct a SipHash calculator initialized with 128-bit key (k0, k1) */

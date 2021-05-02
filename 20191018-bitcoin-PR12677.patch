@@ -1,0 +1,206 @@
+From 1db5493a2ac454447d7ff619e43018a070b03950 Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Fri, 18 Oct 2019 04:02:50 +0000
+Subject: [PATCH 1/4] Expose ancestorsize and ancestorfees via
+ getTransactionAncestry
+
+---
+ src/interfaces/chain.cpp | 4 ++--
+ src/interfaces/chain.h   | 2 +-
+ src/txmempool.cpp        | 4 +++-
+ src/txmempool.h          | 4 +++-
+ 4 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/src/interfaces/chain.cpp b/src/interfaces/chain.cpp
+index 4c5ebe66fc92d..77595b8d6f6aa 100644
+--- a/src/interfaces/chain.cpp
++++ b/src/interfaces/chain.cpp
+@@ -298,11 +298,11 @@ class ChainImpl : public Chain
+         // that Chain clients do not need to know about.
+         return TransactionError::OK == err;
+     }
+-    void getTransactionAncestry(const uint256& txid, size_t& ancestors, size_t& descendants) override
++    void getTransactionAncestry(const uint256& txid, size_t& ancestors, size_t& descendants, size_t* ancestorsize, CAmount* ancestorfees) override
+     {
+         ancestors = descendants = 0;
+         if (!m_node.mempool) return;
+-        m_node.mempool->GetTransactionAncestry(txid, ancestors, descendants);
++        m_node.mempool->GetTransactionAncestry(txid, ancestors, descendants, ancestorsize, ancestorfees);
+     }
+     void getPackageLimits(unsigned int& limit_ancestor_count, unsigned int& limit_descendant_count) override
+     {
+diff --git a/src/interfaces/chain.h b/src/interfaces/chain.h
+index 85d09be0f3308..867736619b1ab 100644
+--- a/src/interfaces/chain.h
++++ b/src/interfaces/chain.h
+@@ -182,7 +182,7 @@ class Chain
+         std::string& err_string) = 0;
+ 
+     //! Calculate mempool ancestor and descendant counts for the given transaction.
+-    virtual void getTransactionAncestry(const uint256& txid, size_t& ancestors, size_t& descendants) = 0;
++    virtual void getTransactionAncestry(const uint256& txid, size_t& ancestors, size_t& descendants, size_t* ancestorsize = nullptr, CAmount* ancestorfees = nullptr) = 0;
+ 
+     //! Get the node's package limits.
+     //! Currently only returns the ancestor and descendant count limits, but could be enhanced to
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 0c2b7319677b5..654451ca5f95d 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -1094,12 +1094,14 @@ uint64_t CTxMemPool::CalculateDescendantMaximum(txiter entry) const {
+     return maximum;
+ }
+ 
+-void CTxMemPool::GetTransactionAncestry(const uint256& txid, size_t& ancestors, size_t& descendants) const {
++void CTxMemPool::GetTransactionAncestry(const uint256& txid, size_t& ancestors, size_t& descendants, size_t* const ancestorsize, CAmount* const ancestorfees) const {
+     LOCK(cs);
+     auto it = mapTx.find(txid);
+     ancestors = descendants = 0;
+     if (it != mapTx.end()) {
+         ancestors = it->GetCountWithAncestors();
++        if (ancestorsize) *ancestorsize = it->GetSizeWithAncestors();
++        if (ancestorfees) *ancestorfees = it->GetModFeesWithAncestors();
+         descendants = CalculateDescendantMaximum(it);
+     }
+ }
+diff --git a/src/txmempool.h b/src/txmempool.h
+index f513f14af637f..f53ac49b605ad 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -712,8 +712,10 @@ class CTxMemPool
+     /**
+      * Calculate the ancestor and descendant count for the given transaction.
+      * The counts include the transaction itself.
++     * When ancestors is non-zero (ie, the transaction itself is in the mempool),
++     * ancestorsize and ancestorfees will also be set to the appropriate values.
+      */
+-    void GetTransactionAncestry(const uint256& txid, size_t& ancestors, size_t& descendants) const;
++    void GetTransactionAncestry(const uint256& txid, size_t& ancestors, size_t& descendants, size_t* ancestorsize = nullptr, CAmount* ancestorfees = nullptr) const;
+ 
+     /** @returns true if the mempool is fully loaded */
+     bool IsLoaded() const;
+
+From 0d3d1f28c8509f8b3674d762f237d3e1c70a31e5 Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Mon, 12 Mar 2018 17:59:50 +0000
+Subject: [PATCH 2/4] RPC: Add ancestor{count,size,fees} to listunspent output
+
+---
+ src/wallet/rpcwallet.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/wallet/rpcwallet.cpp b/src/wallet/rpcwallet.cpp
+index 086ffa127251e..103cd48e5fa19 100644
+--- a/src/wallet/rpcwallet.cpp
++++ b/src/wallet/rpcwallet.cpp
+@@ -2859,6 +2859,9 @@ static RPCHelpMan listunspent()
+                             {RPCResult::Type::STR, "scriptPubKey", "the script key"},
+                             {RPCResult::Type::STR_AMOUNT, "amount", "the transaction output amount in " + CURRENCY_UNIT},
+                             {RPCResult::Type::NUM, "confirmations", "The number of confirmations"},
++                            {RPCResult::Type::NUM, "ancestorcount", "If transaction is in the mempool, the number of in-mempool ancestor transactions (including this one)"},
++                            {RPCResult::Type::NUM, "ancestorsize", "If transaction is in the mempool, the virtual transaction size of in-mempool ancestors (including this one)"},
++                            {RPCResult::Type::STR_AMOUNT, "ancestorfees", "If transaction is in the mempool, the total fees of in-mempool ancestors (including this one) with fee deltas used for mining priority"},
+                             {RPCResult::Type::STR_HEX, "redeemScript", "The redeemScript if scriptPubKey is P2SH"},
+                             {RPCResult::Type::STR, "witnessScript", "witnessScript if the scriptPubKey is P2WSH or P2SH-P2WSH"},
+                             {RPCResult::Type::BOOL, "spendable", "Whether we have the private keys to spend this output"},
+@@ -3025,6 +3028,16 @@ static RPCHelpMan listunspent()
+         entry.pushKV("scriptPubKey", HexStr(scriptPubKey));
+         entry.pushKV("amount", ValueFromAmount(out.tx->tx->vout[out.i].nValue));
+         entry.pushKV("confirmations", out.nDepth);
++        if (!out.nDepth) {
++            size_t ancestor_count, descendant_count, ancestor_size;
++            CAmount ancestor_fees;
++            pwallet->chain().getTransactionAncestry(out.tx->GetHash(), ancestor_count, descendant_count, &ancestor_size, &ancestor_fees);
++            if (ancestor_count) {
++                entry.pushKV("ancestorcount", (uint64_t)ancestor_count);
++                entry.pushKV("ancestorsize", (uint64_t)ancestor_size);
++                entry.pushKV("ancestorfees", (uint64_t)ancestor_fees);
++            }
++        }
+         entry.pushKV("spendable", out.fSpendable);
+         entry.pushKV("solvable", out.fSolvable);
+         if (out.fSolvable) {
+
+From ae4c9c040159c0463afe1c60372d337f454bf874 Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Thu, 18 Jun 2020 18:25:04 +0000
+Subject: [PATCH 3/4] QA: Add tests for listunspent ancestor{count,size,fees}
+ to mempool_packages
+
+---
+ test/functional/mempool_packages.py | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/test/functional/mempool_packages.py b/test/functional/mempool_packages.py
+index d7cb7db9f856f..76d3494522a1a 100755
+--- a/test/functional/mempool_packages.py
++++ b/test/functional/mempool_packages.py
+@@ -64,12 +64,17 @@ def run_test(self):
+         txid = utxo[0]['txid']
+         vout = utxo[0]['vout']
+         value = utxo[0]['amount']
++        assert 'ancestorcount' not in utxo[0]
++        assert 'ancestorsize' not in utxo[0]
++        assert 'ancestorfees' not in utxo[0]
+ 
+         fee = Decimal("0.0001")
+         # MAX_ANCESTORS transactions off a confirmed tx should be fine
+         chain = []
+         witness_chain = []
+-        for _ in range(MAX_ANCESTORS):
++        ancestor_vsize = 0
++        ancestor_fees = Decimal(0)
++        for i in range(MAX_ANCESTORS):
+             (txid, sent_value) = self.chain_transaction(self.nodes[0], txid, 0, value, fee, 1)
+             value = sent_value
+             chain.append(txid)
+@@ -78,6 +83,14 @@ def run_test(self):
+             witnesstx = self.nodes[0].decoderawtransaction(fulltx, True)
+             witness_chain.append(witnesstx['hash'])
+ 
++            wallet_unspent = self.nodes[0].listunspent(minconf=0)
++            this_unspent = next(i for i in wallet_unspent if i['txid'] == txid)
++            assert_equal(this_unspent['ancestorcount'], i + 1)
++            ancestor_vsize += self.nodes[0].getrawtransaction(txid=txid, verbose=True)['vsize']
++            assert_equal(this_unspent['ancestorsize'], ancestor_vsize)
++            ancestor_fees -= self.nodes[0].gettransaction(txid=txid)['fee']
++            assert_equal(this_unspent['ancestorfees'], ancestor_fees * COIN)
++
+         # Wait until mempool transactions have passed initial broadcast (sent inv and received getdata)
+         # Otherwise, getrawmempool may be inconsistent with getmempoolentry if unbroadcast changes in between
+         peer_inv_store.wait_for_broadcast(witness_chain)
+@@ -90,9 +103,9 @@ def run_test(self):
+         descendant_fees = 0
+         descendant_vsize = 0
+ 
+-        ancestor_vsize = sum([mempool[tx]['vsize'] for tx in mempool])
++        assert_equal(ancestor_vsize, sum([mempool[tx]['vsize'] for tx in mempool]))
+         ancestor_count = MAX_ANCESTORS
+-        ancestor_fees = sum([mempool[tx]['fee'] for tx in mempool])
++        assert_equal(ancestor_fees, sum([mempool[tx]['fee'] for tx in mempool]))
+ 
+         descendants = []
+         ancestors = list(chain)
+
+From e9464b696a57b895cb32dc7e429f50039653a805 Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Sun, 9 Aug 2020 19:39:54 +0000
+Subject: [PATCH 4/4] doc/release-notes: Add new listunspent fields
+
+---
+ doc/release-notes-12677.md | 7 +++++++
+ 1 file changed, 7 insertions(+)
+ create mode 100644 doc/release-notes-12677.md
+
+diff --git a/doc/release-notes-12677.md b/doc/release-notes-12677.md
+new file mode 100644
+index 0000000000000..730ba43e98eef
+--- /dev/null
++++ b/doc/release-notes-12677.md
+@@ -0,0 +1,7 @@
++Notable changes
++===============
++
++Updated RPCs
++------------
++
++- `listunspent` now includes `ancestorcount`, `ancestorsize`, and `ancestorfees` in some cases.

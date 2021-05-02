@@ -1,0 +1,701 @@
+From b4b01fec3f3b3dc98017b64718c9a28680cc1d7d Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Mon, 6 Jul 2020 03:22:02 +0000
+Subject: [PATCH 1/6] Add ability to block pruning of specific block ranges
+
+---
+ src/chain.h              |  6 ++++++
+ src/interfaces/chain.cpp | 15 +++++++++++++++
+ src/interfaces/chain.h   |  5 +++++
+ src/validation.cpp       | 33 +++++++++++++++++++++++++++++++++
+ src/validation.h         |  6 ++++++
+ 5 files changed, 65 insertions(+)
+
+diff --git a/src/chain.h b/src/chain.h
+index 43e8a39f3643c..73a4ce2236617 100644
+--- a/src/chain.h
++++ b/src/chain.h
+@@ -429,4 +429,10 @@ class CChain {
+     CBlockIndex* FindEarliestAtLeast(int64_t nTime, int height) const;
+ };
+ 
++struct PruneLockInfo {
++    std::string m_desc;
++    uint64_t m_height_first{std::numeric_limits<uint64_t>::max()};
++    uint64_t m_height_last{std::numeric_limits<uint64_t>::max()};
++};
++
+ #endif // BITCOIN_CHAIN_H
+diff --git a/src/interfaces/chain.cpp b/src/interfaces/chain.cpp
+index 4c5ebe66fc92d..eae0b53a341e6 100644
+--- a/src/interfaces/chain.cpp
++++ b/src/interfaces/chain.cpp
+@@ -176,6 +176,21 @@ class ChainImpl : public Chain
+         CBlockIndex* block = ::ChainActive()[height];
+         return block && ((block->nStatus & BLOCK_HAVE_DATA) != 0) && block->nTx > 0;
+     }
++    bool pruneLockExists(const std::string& lockid) override
++    {
++        LOCK(g_prune_locks_mutex);
++        return PruneLockExists(lockid);
++    }
++    void setPruneLock(const std::string& lockid, const PruneLockInfo& lockinfo) override
++    {
++        LOCK(g_prune_locks_mutex);
++        SetPruneLock(lockid, lockinfo);
++    }
++    void deletePruneLock(const std::string& lockid) override
++    {
++        LOCK(g_prune_locks_mutex);
++        DeletePruneLock(lockid);
++    }
+     Optional<int> findFirstBlockWithTimeAndHeight(int64_t time, int height, uint256* hash) override
+     {
+         LOCK(cs_main);
+diff --git a/src/interfaces/chain.h b/src/interfaces/chain.h
+index 85d09be0f3308..7fb881617eaeb 100644
+--- a/src/interfaces/chain.h
++++ b/src/interfaces/chain.h
+@@ -29,6 +29,7 @@ struct bilingual_str;
+ struct CBlockLocator;
+ struct FeeCalculation;
+ struct NodeContext;
++struct PruneLockInfo;
+ 
+ namespace interfaces {
+ 
+@@ -102,6 +103,10 @@ class Chain
+     //! pruned), and contains transactions.
+     virtual bool haveBlockOnDisk(int height) = 0;
+ 
++    virtual bool pruneLockExists(const std::string& lockid) = 0;
++    virtual void setPruneLock(const std::string& lockid, const PruneLockInfo&) = 0;
++    virtual void deletePruneLock(const std::string& lockid) = 0;
++
+     //! Return height of the first block in the chain with timestamp equal
+     //! or greater than the given time and height equal or greater than the
+     //! given height, or nullopt if there is no block with a high enough
+diff --git a/src/validation.cpp b/src/validation.cpp
+index feb7502a0fa54..c82ee9b4190f2 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -141,6 +141,8 @@ bool fRequireStandard = true;
+ bool fCheckBlockIndex = false;
+ bool fCheckpointsEnabled = DEFAULT_CHECKPOINTS_ENABLED;
+ uint64_t nPruneTarget = 0;
++Mutex g_prune_locks_mutex;
++std::unordered_map<std::string, PruneLockInfo> g_prune_locks;
+ int64_t nMaxTipAge = DEFAULT_MAX_TIP_AGE;
+ 
+ uint256 hashAssumeValid;
+@@ -3961,6 +3963,32 @@ void UnlinkPrunedFiles(const std::set<int>& setFilesToPrune)
+     }
+ }
+ 
++static bool DoPruneLocksForbidPruning(const CBlockFileInfo& block_file_info)
++{
++    LOCK(g_prune_locks_mutex);
++    for (const auto& prune_lock : g_prune_locks) {
++        if (block_file_info.nHeightFirst > prune_lock.second.m_height_last) continue;
++        if (block_file_info.nHeightLast < prune_lock.second.m_height_first) continue;
++        // TODO: Check each block within the file against the prune_lock range
++        return true;
++    }
++    return false;
++}
++
++bool PruneLockExists(const std::string& lockid) {
++    return g_prune_locks.count(lockid);
++}
++
++void SetPruneLock(const std::string& lockid, const PruneLockInfo& lockinfo)
++{
++    g_prune_locks[lockid] = lockinfo;
++}
++
++void DeletePruneLock(const std::string& lockid)
++{
++    g_prune_locks.erase(lockid);
++}
++
+ void BlockManager::FindFilesToPruneManual(std::set<int>& setFilesToPrune, int nManualPruneHeight, int chain_tip_height)
+ {
+     assert(fPruneMode && nManualPruneHeight > 0);
+@@ -3977,6 +4005,9 @@ void BlockManager::FindFilesToPruneManual(std::set<int>& setFilesToPrune, int nM
+         if (vinfoBlockFile[fileNumber].nSize == 0 || vinfoBlockFile[fileNumber].nHeightLast > nLastBlockWeCanPrune) {
+             continue;
+         }
++
++        if (DoPruneLocksForbidPruning(vinfoBlockFile[fileNumber])) continue;
++
+         PruneOneBlockFile(fileNumber);
+         setFilesToPrune.insert(fileNumber);
+         count++;
+@@ -4040,6 +4071,8 @@ void BlockManager::FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPr
+                 continue;
+             }
+ 
++            if (DoPruneLocksForbidPruning(vinfoBlockFile[fileNumber])) continue;
++
+             PruneOneBlockFile(fileNumber);
+             // Queue up the files for removal
+             setFilesToPrune.insert(fileNumber);
+diff --git a/src/validation.h b/src/validation.h
+index ffb038ad75f0d..3aa3f880369c9 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -193,6 +193,12 @@ uint64_t CalculateCurrentUsage();
+  */
+ void UnlinkPrunedFiles(const std::set<int>& setFilesToPrune);
+ 
++extern Mutex g_prune_locks_mutex;
++extern std::unordered_map<std::string, PruneLockInfo> g_prune_locks GUARDED_BY(g_prune_locks_mutex);
++bool PruneLockExists(const std::string& lockid) SHARED_LOCKS_REQUIRED(g_prune_locks_mutex);
++void SetPruneLock(const std::string& lockid, const PruneLockInfo&) EXCLUSIVE_LOCKS_REQUIRED(g_prune_locks_mutex);
++void DeletePruneLock(const std::string& lockid) EXCLUSIVE_LOCKS_REQUIRED(g_prune_locks_mutex);
++
+ /** Prune block files up to a given height */
+ void PruneBlockFilesManual(int nManualPruneHeight);
+ 
+
+From 4724f3480c94e612f1b44f655d39e1f11e78cbde Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Tue, 7 Jul 2020 03:20:06 +0000
+Subject: [PATCH 2/6] Persist prune locks in blocks/index db
+
+---
+ src/chain.h              |  7 +++++++
+ src/interfaces/chain.cpp |  8 ++++----
+ src/interfaces/chain.h   |  4 ++--
+ src/txdb.cpp             | 30 +++++++++++++++++++++++++++++-
+ src/txdb.h               |  6 +++++-
+ src/validation.cpp       | 22 +++++++++++++++++++---
+ src/validation.h         |  4 ++--
+ 7 files changed, 68 insertions(+), 13 deletions(-)
+
+diff --git a/src/chain.h b/src/chain.h
+index 73a4ce2236617..0684c5384655f 100644
+--- a/src/chain.h
++++ b/src/chain.h
+@@ -433,6 +433,13 @@ struct PruneLockInfo {
+     std::string m_desc;
+     uint64_t m_height_first{std::numeric_limits<uint64_t>::max()};
+     uint64_t m_height_last{std::numeric_limits<uint64_t>::max()};
++
++    SERIALIZE_METHODS(PruneLockInfo, obj)
++    {
++        READWRITE(obj.m_desc);
++        READWRITE(VARINT(obj.m_height_first));
++        READWRITE(VARINT(obj.m_height_last));
++    }
+ };
+ 
+ #endif // BITCOIN_CHAIN_H
+diff --git a/src/interfaces/chain.cpp b/src/interfaces/chain.cpp
+index eae0b53a341e6..0d8566bd4f8c8 100644
+--- a/src/interfaces/chain.cpp
++++ b/src/interfaces/chain.cpp
+@@ -181,15 +181,15 @@ class ChainImpl : public Chain
+         LOCK(g_prune_locks_mutex);
+         return PruneLockExists(lockid);
+     }
+-    void setPruneLock(const std::string& lockid, const PruneLockInfo& lockinfo) override
++    bool setPruneLock(const std::string& lockid, const PruneLockInfo& lockinfo, bool sync) override
+     {
+         LOCK(g_prune_locks_mutex);
+-        SetPruneLock(lockid, lockinfo);
++        return SetPruneLock(lockid, lockinfo, sync);
+     }
+-    void deletePruneLock(const std::string& lockid) override
++    bool deletePruneLock(const std::string& lockid) override
+     {
+         LOCK(g_prune_locks_mutex);
+-        DeletePruneLock(lockid);
++        return DeletePruneLock(lockid);
+     }
+     Optional<int> findFirstBlockWithTimeAndHeight(int64_t time, int height, uint256* hash) override
+     {
+diff --git a/src/interfaces/chain.h b/src/interfaces/chain.h
+index 7fb881617eaeb..1c8257db8aceb 100644
+--- a/src/interfaces/chain.h
++++ b/src/interfaces/chain.h
+@@ -104,8 +104,8 @@ class Chain
+     virtual bool haveBlockOnDisk(int height) = 0;
+ 
+     virtual bool pruneLockExists(const std::string& lockid) = 0;
+-    virtual void setPruneLock(const std::string& lockid, const PruneLockInfo&) = 0;
+-    virtual void deletePruneLock(const std::string& lockid) = 0;
++    virtual bool setPruneLock(const std::string& lockid, const PruneLockInfo&, bool sync=false) = 0;
++    virtual bool deletePruneLock(const std::string& lockid) = 0;
+ 
+     //! Return height of the first block in the chain with timestamp equal
+     //! or greater than the given time and height equal or greater than the
+diff --git a/src/txdb.cpp b/src/txdb.cpp
+index 72460e7c695a4..1500755fa918c 100644
+--- a/src/txdb.cpp
++++ b/src/txdb.cpp
+@@ -27,6 +27,7 @@ static const char DB_HEAD_BLOCKS = 'H';
+ static const char DB_FLAG = 'F';
+ static const char DB_REINDEX_FLAG = 'R';
+ static const char DB_LAST_BLOCK = 'l';
++static const char DB_PRUNE_LOCK = 'L';
+ 
+ namespace {
+ 
+@@ -219,7 +220,7 @@ void CCoinsViewDBCursor::Next()
+     }
+ }
+ 
+-bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*> >& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo) {
++bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*> >& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo, const std::unordered_map<std::string, PruneLockInfo>& prune_locks) {
+     CDBBatch batch(*this);
+     for (std::vector<std::pair<int, const CBlockFileInfo*> >::const_iterator it=fileInfo.begin(); it != fileInfo.end(); it++) {
+         batch.Write(std::make_pair(DB_BLOCK_FILES, it->first), *it->second);
+@@ -228,9 +229,36 @@ bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockF
+     for (std::vector<const CBlockIndex*>::const_iterator it=blockinfo.begin(); it != blockinfo.end(); it++) {
+         batch.Write(std::make_pair(DB_BLOCK_INDEX, (*it)->GetBlockHash()), CDiskBlockIndex(*it));
+     }
++    for (const auto& prune_lock : prune_locks) {
++        batch.Write(std::make_pair(DB_PRUNE_LOCK, prune_lock.first), prune_lock.second);
++    }
+     return WriteBatch(batch, true);
+ }
+ 
++bool CBlockTreeDB::WritePruneLock(const std::string& name, const PruneLockInfo& lockinfo) {
++    return Write(std::make_pair(DB_PRUNE_LOCK, name), lockinfo);
++}
++
++bool CBlockTreeDB::DeletePruneLock(const std::string& name) {
++    return Erase(std::make_pair(DB_PRUNE_LOCK, name));
++}
++
++bool CBlockTreeDB::LoadPruneLocks(std::unordered_map<std::string, PruneLockInfo>& prune_locks) {
++    std::unique_ptr<CDBIterator> pcursor(NewIterator());
++    for (pcursor->Seek(DB_PRUNE_LOCK); pcursor->Valid(); pcursor->Next()) {
++        if (ShutdownRequested()) return false;
++
++        std::pair<char, std::string> key;
++        if ((!pcursor->GetKey(key)) || key.first != DB_PRUNE_LOCK) break;
++
++        if (!pcursor->GetValue(prune_locks[key.second])) {
++            return error("%s: failed to %s prune lock '%s'", __func__, "read", key.second);
++        }
++    }
++
++    return true;
++}
++
+ bool CBlockTreeDB::WriteFlag(const std::string &name, bool fValue) {
+     return Write(std::make_pair(DB_FLAG, name), fValue ? '1' : '0');
+ }
+diff --git a/src/txdb.h b/src/txdb.h
+index 0cf7e2f1b8b33..8404da3ef8974 100644
+--- a/src/txdb.h
++++ b/src/txdb.h
+@@ -13,6 +13,7 @@
+ 
+ #include <memory>
+ #include <string>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+@@ -98,14 +99,17 @@ class CBlockTreeDB : public CDBWrapper
+ public:
+     explicit CBlockTreeDB(size_t nCacheSize, bool fMemory = false, bool fWipe = false);
+ 
+-    bool WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*> >& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo);
++    bool WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*> >& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo, const std::unordered_map<std::string, PruneLockInfo>& prune_locks);
+     bool ReadBlockFileInfo(int nFile, CBlockFileInfo &info);
+     bool ReadLastBlockFile(int &nFile);
+     bool WriteReindexing(bool fReindexing);
+     void ReadReindexing(bool &fReindexing);
++    bool WritePruneLock(const std::string& name, const PruneLockInfo&);
++    bool DeletePruneLock(const std::string& name);
+     bool WriteFlag(const std::string &name, bool fValue);
+     bool ReadFlag(const std::string &name, bool &fValue);
+     bool LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&)> insertBlockIndex);
++    bool LoadPruneLocks(std::unordered_map<std::string, PruneLockInfo>& prune_locks);
+ };
+ 
+ #endif // BITCOIN_TXDB_H
+diff --git a/src/validation.cpp b/src/validation.cpp
+index c82ee9b4190f2..16e83b5e5037d 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2368,7 +2368,8 @@ bool CChainState::FlushStateToDisk(
+                     vBlocks.push_back(*it);
+                     setDirtyBlockIndex.erase(it++);
+                 }
+-                if (!pblocktree->WriteBatchSync(vFiles, nLastBlockFile, vBlocks)) {
++                LOCK(g_prune_locks_mutex);
++                if (!pblocktree->WriteBatchSync(vFiles, nLastBlockFile, vBlocks, g_prune_locks)) {
+                     return AbortNode(state, "Failed to write to block index database");
+                 }
+             }
+@@ -3979,14 +3980,25 @@ bool PruneLockExists(const std::string& lockid) {
+     return g_prune_locks.count(lockid);
+ }
+ 
+-void SetPruneLock(const std::string& lockid, const PruneLockInfo& lockinfo)
++bool SetPruneLock(const std::string& lockid, const PruneLockInfo& lockinfo, const bool sync)
+ {
++    if (sync) {
++        if (!pblocktree->WritePruneLock(lockid, lockinfo)) {
++            return error("%s: failed to %s prune lock '%s'", __func__, "write", lockid);
++        }
++    }
+     g_prune_locks[lockid] = lockinfo;
++    return true;
+ }
+ 
+-void DeletePruneLock(const std::string& lockid)
++bool DeletePruneLock(const std::string& lockid)
+ {
+     g_prune_locks.erase(lockid);
++    // Since there is no reasonable expectation for any follow-up to this prune lock, actually ensure it gets committed to disk immediately
++    if (!pblocktree->DeletePruneLock(lockid)) {
++        return error("%s: failed to %s prune lock '%s'", __func__, "erase", lockid);
++    }
++    return true;
+ }
+ 
+ void BlockManager::FindFilesToPruneManual(std::set<int>& setFilesToPrune, int nManualPruneHeight, int chain_tip_height)
+@@ -4138,6 +4150,10 @@ bool BlockManager::LoadBlockIndex(
+ {
+     if (!blocktree.LoadBlockIndexGuts(consensus_params, [this](const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash); }))
+         return false;
++    {
++        LOCK(g_prune_locks_mutex);
++        if (!blocktree.LoadPruneLocks(g_prune_locks)) return false;
++    }
+ 
+     // Calculate nChainWork
+     std::vector<std::pair<int, CBlockIndex*> > vSortedByHeight;
+diff --git a/src/validation.h b/src/validation.h
+index 3aa3f880369c9..f7d3c86b3ec54 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -196,8 +196,8 @@ void UnlinkPrunedFiles(const std::set<int>& setFilesToPrune);
+ extern Mutex g_prune_locks_mutex;
+ extern std::unordered_map<std::string, PruneLockInfo> g_prune_locks GUARDED_BY(g_prune_locks_mutex);
+ bool PruneLockExists(const std::string& lockid) SHARED_LOCKS_REQUIRED(g_prune_locks_mutex);
+-void SetPruneLock(const std::string& lockid, const PruneLockInfo&) EXCLUSIVE_LOCKS_REQUIRED(g_prune_locks_mutex);
+-void DeletePruneLock(const std::string& lockid) EXCLUSIVE_LOCKS_REQUIRED(g_prune_locks_mutex);
++bool SetPruneLock(const std::string& lockid, const PruneLockInfo&, bool sync=false) EXCLUSIVE_LOCKS_REQUIRED(g_prune_locks_mutex);
++bool DeletePruneLock(const std::string& lockid) EXCLUSIVE_LOCKS_REQUIRED(g_prune_locks_mutex);
+ 
+ /** Prune block files up to a given height */
+ void PruneBlockFilesManual(int nManualPruneHeight);
+
+From 33ee538a9b02f3f132792c5ca3390799b8176466 Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Tue, 7 Jul 2020 05:45:04 +0000
+Subject: [PATCH 3/6] Support for temporary prune locks (that don't persist
+ across restart)
+
+---
+ src/chain.h        | 1 +
+ src/txdb.cpp       | 2 ++
+ src/validation.cpp | 5 +++++
+ 3 files changed, 8 insertions(+)
+
+diff --git a/src/chain.h b/src/chain.h
+index 0684c5384655f..99308b42a7a6b 100644
+--- a/src/chain.h
++++ b/src/chain.h
+@@ -433,6 +433,7 @@ struct PruneLockInfo {
+     std::string m_desc;
+     uint64_t m_height_first{std::numeric_limits<uint64_t>::max()};
+     uint64_t m_height_last{std::numeric_limits<uint64_t>::max()};
++    bool m_temporary{false};
+ 
+     SERIALIZE_METHODS(PruneLockInfo, obj)
+     {
+diff --git a/src/txdb.cpp b/src/txdb.cpp
+index 1500755fa918c..007b164fd7449 100644
+--- a/src/txdb.cpp
++++ b/src/txdb.cpp
+@@ -230,12 +230,14 @@ bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockF
+         batch.Write(std::make_pair(DB_BLOCK_INDEX, (*it)->GetBlockHash()), CDiskBlockIndex(*it));
+     }
+     for (const auto& prune_lock : prune_locks) {
++        if (prune_lock.second.m_temporary) continue;
+         batch.Write(std::make_pair(DB_PRUNE_LOCK, prune_lock.first), prune_lock.second);
+     }
+     return WriteBatch(batch, true);
+ }
+ 
+ bool CBlockTreeDB::WritePruneLock(const std::string& name, const PruneLockInfo& lockinfo) {
++    if (lockinfo.m_temporary) return true;
+     return Write(std::make_pair(DB_PRUNE_LOCK, name), lockinfo);
+ }
+ 
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 16e83b5e5037d..b0f854fac5a59 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -3986,6 +3986,11 @@ bool SetPruneLock(const std::string& lockid, const PruneLockInfo& lockinfo, cons
+         if (!pblocktree->WritePruneLock(lockid, lockinfo)) {
+             return error("%s: failed to %s prune lock '%s'", __func__, "write", lockid);
+         }
++    } else if (lockinfo.m_temporary && g_prune_locks.count(lockid) && !g_prune_locks.at(lockid).m_temporary) {
++        // Erase non-temporary lock from disk
++        if (!pblocktree->DeletePruneLock(lockid)) {
++            return error("%s: failed to %s prune lock '%s'", __func__, "erase", lockid);
++        }
+     }
+     g_prune_locks[lockid] = lockinfo;
+     return true;
+
+From d0c97919b1feb8ffc874aa898c5377edfcfa4fa2 Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Tue, 7 Jul 2020 06:17:07 +0000
+Subject: [PATCH 4/6] Roll back tip prune locks when doing a reorg
+
+---
+ src/validation.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/validation.cpp b/src/validation.cpp
+index b0f854fac5a59..d50259d5e7530 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2530,6 +2530,17 @@ bool CChainState::DisconnectTip(BlockValidationState& state, const CChainParams&
+         assert(flushed);
+     }
+     LogPrint(BCLog::BENCH, "- Disconnect block: %.2fms\n", (GetTimeMicros() - nStart) * MILLI);
++
++    {
++        // Prune locks that began around the tip should get rolled backward so they get a chance to reorg
++        LOCK(g_prune_locks_mutex);
++        for (auto& prune_lock : g_prune_locks) {
++            if (prune_lock.second.m_height_first < uint64_t(pindexDelete->nHeight) - 1) continue;
++            --prune_lock.second.m_height_first;
++            // NOTE: Don't need to write to db here, since it will get synced when the rest of the chainstate
++        }
++    }
++
+     // Write the chain state to disk, if necessary.
+     if (!FlushStateToDisk(chainparams, state, FlushStateMode::IF_NEEDED))
+         return false;
+
+From 9570f6a061d38f84c1376b158b01d4e146a84cf1 Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Wed, 8 Jul 2020 03:51:17 +0000
+Subject: [PATCH 5/6] RPC: blockchain: Add listprunelocks and setprunelock
+ methods
+
+---
+ src/rpc/blockchain.cpp | 146 +++++++++++++++++++++++++++++++++++++++++
+ src/rpc/client.cpp     |   1 +
+ 2 files changed, 147 insertions(+)
+
+diff --git a/src/rpc/blockchain.cpp b/src/rpc/blockchain.cpp
+index 392073d047078..a9246ecdcc902 100644
+--- a/src/rpc/blockchain.cpp
++++ b/src/rpc/blockchain.cpp
+@@ -974,6 +974,150 @@ static RPCHelpMan getblock()
+     };
+ }
+ 
++static UniValue listprunelocks(const JSONRPCRequest& request)
++{
++    RPCHelpMan{"listprunelocks",
++        "\nReturns a list of pruning locks.\n",
++        {},
++        RPCResult{
++            RPCResult::Type::OBJ, "", "",
++            {
++                {RPCResult::Type::ARR, "prune_locks", "",
++                {
++                    {RPCResult::Type::OBJ, "", "",
++                    {
++                        {RPCResult::Type::STR, "id", "A unique identifier for the lock"},
++                        {RPCResult::Type::STR, "desc", "A description of the lock's purpose"},
++                        {RPCResult::Type::ARR_FIXED, "height", "Range of blocks prevented from being pruned",
++                        {
++                            {RPCResult::Type::NUM, "height_first", "Height of first block that may not be pruned"},
++                            {RPCResult::Type::NUM, "height_last", "Height of last block that may not be pruned (omitted if unbounded)"},
++                        }},
++                        {RPCResult::Type::BOOL, "temporary", "Indicates the lock will not remain after a restart of the node"},
++                    }},
++                }},
++            }
++        },
++        RPCExamples{
++            HelpExampleCli("listprunelocks", "")
++          + HelpExampleRpc("listprunelocks", "")
++        },
++    }.Check(request);
++
++    UniValue locks_uv(UniValue::VARR);
++    {
++        LOCK(g_prune_locks_mutex);
++        for (const auto& prune_lock : g_prune_locks) {
++            UniValue prune_lock_uv(UniValue::VOBJ);
++            const auto& lockinfo = prune_lock.second;
++            prune_lock_uv.pushKV("id", prune_lock.first);
++            prune_lock_uv.pushKV("desc", lockinfo.m_desc);
++            UniValue heights_uv(UniValue::VARR);
++            heights_uv.push_back(lockinfo.m_height_first);
++            if (lockinfo.m_height_last < std::numeric_limits<uint64_t>::max()) {
++                heights_uv.push_back(lockinfo.m_height_last);
++            }
++            prune_lock_uv.pushKV("height", heights_uv);
++            locks_uv.push_back(prune_lock_uv);
++        }
++    }
++
++    UniValue result(UniValue::VOBJ);
++    result.pushKV("prune_locks", locks_uv);
++    return result;
++}
++
++static UniValue setprunelock(const JSONRPCRequest& request)
++{
++    RPCHelpMan{"setprunelock",
++        "\nManipulate pruning locks.\n",
++        {
++            {"id", RPCArg::Type::STR, RPCArg::Optional::NO, "The unique id of the manipulated prune lock (or \"*\" if deleting all)"},
++            {"lock_info", RPCArg::Type::OBJ, RPCArg::Optional::NO, "An object describing the desired lock",
++                {
++                    {"desc", RPCArg::Type::STR, RPCArg::Optional::NO, "Description of the lock"},
++                    {"height", RPCArg::Type::RANGE, /* default */ "deletes the lock", "The range of block heights to prevent pruning"},
++                    {"sync", RPCArg::Type::BOOL, /* default */ "false", "If true, success indicates the lock change was stored to disk (if non-temporary). If false, it is possible for a subsequent node crash to lose the lock."},
++                    {"temporary", RPCArg::Type::BOOL, /* default */ "false", "If true, the lock will not persist across node restart."},
++                },
++            },
++        },
++        RPCResult{
++            RPCResult::Type::OBJ, "", "",
++            {
++                {RPCResult::Type::BOOL, "success", "Whether the change was successful"},
++            }},
++        RPCExamples{
++            HelpExampleCli("setprunelock", "\"test\" \"{\\\"desc\\\": \\\"Just a test\\\", \\\"height\\\": [0,100]}\"")
++          + HelpExampleCli("setprunelock", "\"test-2\" \"{\\\"desc\\\": \\\"Second RPC-created prunelock test\\\", \\\"height\\\": [100]}\"")
++          + HelpExampleRpc("setprunelock", "\"test\", {\"desc\": \"Just a test\", \"height\": [0,100]}")
++        },
++    }.Check(request);
++
++    RPCTypeCheck(request.params, {UniValue::VSTR, UniValue::VOBJ});
++    const auto& lockinfo_json = request.params[1];
++    RPCTypeCheckObj(lockinfo_json,
++        {
++            {"desc", UniValueType(UniValue::VSTR)},
++            {"height", UniValueType()}, // will be checked below
++            {"sync", UniValueType(UniValue::VBOOL)},
++            {"temporary", UniValueType(UniValue::VBOOL)},
++        },
++        /*allow_null=*/ true, /*strict=*/ true);
++
++    const auto& lockid = request.params[0].get_str();
++
++    PruneLockInfo lockinfo;
++
++    auto height_param = lockinfo_json["height"];
++    if (!height_param.isArray()) {
++        UniValue new_height_param(UniValue::VARR);
++        new_height_param.push_back(std::move(height_param));
++        height_param = std::move(new_height_param);
++    }
++    bool success;
++    if (height_param[0].isNull() && height_param[1].isNull()) {
++        // Delete
++        if (lockid == "*") {
++            // Delete all
++            success = true;
++            std::vector<std::string> all_ids;
++            LOCK(g_prune_locks_mutex);
++            for (const auto& prune_lock : g_prune_locks) {
++                all_ids.push_back(prune_lock.first);
++            }
++            for (auto& lockid : all_ids) {
++                success |= DeletePruneLock(lockid);
++            }
++        } else {
++            LOCK(g_prune_locks_mutex);
++            success = PruneLockExists(lockid) && DeletePruneLock(lockid);
++        }
++    } else {
++        if (lockid == "*") throw JSONRPCError(RPC_INVALID_PARAMETER, "id \"*\" only makes sense when deleting");
++        if (!height_param[0].isNum()) throw JSONRPCError(RPC_TYPE_ERROR, "Invalid start height");
++        lockinfo.m_height_first = height_param[0].get_int64();
++        if (!height_param[1].isNull()) {
++            if (!height_param[1].isNum()) throw JSONRPCError(RPC_TYPE_ERROR, "Invalid end height");
++            lockinfo.m_height_last = height_param[1].get_int64();
++        }
++        lockinfo.m_desc = lockinfo_json["desc"].get_str();
++        if (!lockinfo_json["temporary"].isNull()) {
++            lockinfo.m_temporary = lockinfo_json["temporary"].get_bool();
++        }
++        bool sync = false;
++        if (!lockinfo_json["sync"].isNull()) {
++            sync = lockinfo_json["sync"].get_bool();
++        }
++        LOCK(g_prune_locks_mutex);
++        success = SetPruneLock(lockid, lockinfo, sync);
++    }
++
++    UniValue result(UniValue::VOBJ);
++    result.pushKV("success", success);
++    return result;
++}
++
+ static RPCHelpMan pruneblockchain()
+ {
+     return RPCHelpMan{"pruneblockchain", "",
+@@ -2483,6 +2627,8 @@ static const CRPCCommand commands[] =
+     { "blockchain",         "getrawmempool",          &getrawmempool,          {"verbose", "mempool_sequence"} },
+     { "blockchain",         "gettxout",               &gettxout,               {"txid","n","include_mempool"} },
+     { "blockchain",         "gettxoutsetinfo",        &gettxoutsetinfo,        {"hash_type"} },
++    { "blockchain",         "listprunelocks",         &listprunelocks,         {} },
++    { "blockchain",         "setprunelock",           &setprunelock,           {"id", "lock_info"} },
+     { "blockchain",         "pruneblockchain",        &pruneblockchain,        {"height"} },
+     { "blockchain",         "savemempool",            &savemempool,            {} },
+     { "blockchain",         "verifychain",            &verifychain,            {"checklevel","nblocks"} },
+diff --git a/src/rpc/client.cpp b/src/rpc/client.cpp
+index 042005b9a6aea..897ea87c6ac3a 100644
+--- a/src/rpc/client.cpp
++++ b/src/rpc/client.cpp
+@@ -144,6 +144,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
+     { "verifychain", 1, "nblocks" },
+     { "getblockstats", 0, "hash_or_height" },
+     { "getblockstats", 1, "stats" },
++    { "setprunelock", 1, "lock_info" },
+     { "pruneblockchain", 0, "height" },
+     { "keypoolrefill", 0, "newsize" },
+     { "getrawmempool", 0, "verbose" },
+
+From fd4263690543344d7cad7555746bbd59e056635e Mon Sep 17 00:00:00 2001
+From: Luke Dashjr <luke-jr+git@utopios.org>
+Date: Wed, 29 Jul 2020 04:19:37 +0000
+Subject: [PATCH 6/6] QA: Test prune locks via RPC
+
+---
+ test/functional/feature_pruning.py | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/test/functional/feature_pruning.py b/test/functional/feature_pruning.py
+index f09bffe2d40b4..1752551f303fc 100755
+--- a/test/functional/feature_pruning.py
++++ b/test/functional/feature_pruning.py
+@@ -301,6 +301,17 @@ def has_block(index):
+         node.pruneblockchain(height(0))
+         assert has_block(0), "blk00000.dat is missing when should still be there"
+ 
++        # height=500 shouldn't prune first file if there's a prune lock
++        node.setprunelock("test", {
++            "desc": "Testing",
++            "height": [2, 2],
++        })
++        assert_equal(node.listprunelocks(), {'prune_locks': [{'id': 'test', 'desc': 'Testing', 'height': [2, 2]}]})
++        prune(500)
++        assert has_block(0), "blk00000.dat is missing when should still be there"
++        node.setprunelock("test", {})  # delete prune lock
++        assert_equal(node.listprunelocks(), {'prune_locks': []})
++
+         # height=500 should prune first file
+         prune(500)
+         assert not has_block(0), "blk00000.dat is still there, should be pruned by now"
